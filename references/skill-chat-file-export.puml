@@ -1,0 +1,113 @@
+@startuml
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 180
+skinparam noteBackgroundColor #FFF8DC
+skinparam partitionBackgroundColor #F7F7F7
+
+title Bitrix24 REST API: выгрузка задачи, чатов и файлов (доработка)
+
+actor "Пользователь" as User
+participant "fetch_bitrix_task_context.py\nCLI / orchestration" as CLI
+participant "BitrixRest\nraw REST + redact()" as Rest
+participant "Bitrix24 REST API" as API
+participant "Файловая система\n<out-dir>" as FS
+
+autonumber
+
+User -> CLI: task_id / --url / --dialog\n+ новый --download-files (opt-in)
+CLI -> CLI: resolve_webhook()\n.env / env / --webhook-url
+CLI -> Rest: BitrixRest(webhook)
+note right of Rest
+  Токен вебхука и подписанные URL
+  не выводить в консоль, JSON и Markdown.
+end note
+
+alt Режимы --chats / --unread / --find / --info
+  CLI -> Rest: im.recent.get / im.counters.get /\nim.search.chat.list / im.dialog.get / im.dialog.users.list
+  Rest -> API: POST <method>.json
+  API --> Rest: result / error
+  Rest --> CLI: нормализованные данные
+  CLI -> FS: chats_*.{md,json} или <dialog>_info.json
+else Задача и/или явные диалоги
+  opt task_id != 0
+    CLI -> Rest: tasks.task.get(taskId, select[..., CHAT_ID])
+    Rest -> API: POST tasks.task.get.json
+    API --> Rest: карточка задачи, chatId, description
+    Rest --> CLI: unwrap_batch(result)
+    CLI -> CLI: CHAT_ID + IM_DIALOG из description\n+ аргументы --dialog; удалить дубликаты
+    opt legacy-комментарии (best effort)
+      CLI -> Rest: task.commentitem.getlist(TASKID, ORDER)
+      Rest -> API: POST task.commentitem.getlist.json
+      API --> Rest: комментарии или ошибка портала
+      Rest --> CLI: ошибка фиксируется, выгрузка продолжается
+    end
+  end
+
+  loop Каждый dialog_id
+    CLI -> Rest: fetch_chat_messages(dialog_id, limit)
+    loop Пока есть история и не достигнут limit
+      Rest -> API: im.dialog.messages.get\nDIALOG_ID, LIMIT <= 50, LAST_ID = min(id)
+      API --> Rest: messages[] (newest first), users[], files[]
+      Rest --> CLI: страница без batch-обёртки
+      CLI -> CLI: накопить сообщения, users и files\nсортировать сообщения по id после обхода
+    end
+    CLI -> CLI: sync_chat_users() → user.get\nдля авторов, отсутствующих в users[]
+  end
+
+  CLI -> FS: task_<id>.json\nсырые карточка, сообщения, users, files, meta
+
+  opt Новый режим --download-files
+    CLI -> CLI: Собрать params.FILE_ID из сообщений\nи связать с files[] по id\nКлюч дедупликации: (dialog_id, file_id)
+
+    loop Каждый уникальный файл
+      alt Файл уже есть и размер совпадает
+        CLI -> FS: пропустить скачивание\nобновить связи в manifest
+      else Нужно скачать / повторить
+        CLI -> Rest: im.v2.File.download\n{dialogId: dialog_id, fileId: file_id}
+        Rest -> API: POST im.v2.File.download.json
+        alt Ссылка получена
+          API --> Rest: result.downloadUrl\nодноразовая подписанная ссылка
+          Rest --> CLI: downloadUrl (не логировать)
+          CLI -> API: GET downloadUrl, redirects\nUser-Agent, Accept, Accept-Language, Referer
+          alt HTTP 200 + тело файла, не HTML/JSON-ошибка
+            API --> CLI: бинарное содержимое
+            CLI -> CLI: Безопасное имя: <fileId>_<name>\nпроверить размер, если files[].size известен
+            CLI -> FS: записать .part → атомарно rename\nfiles/<dialog_id>/<fileId>_<safe_name>
+            CLI -> FS: manifest: success, path, size, sha256,\nmessage_ids, имя, file_id, dialog_id
+          else Ошибка HTTP / HTML входа / JSON-ошибка / размер не совпал
+            API --> CLI: ошибка или неподходящее тело
+            CLI -> FS: manifest: error + безопасное описание\nне сохранять тело как файл
+          end
+        else FILE_NOT_FOUND / ACCESS_DENIED /\nVIDEO_NOTE_DOWNLOAD_RESTRICTED / другая ошибка
+          API --> Rest: error, error_description
+          Rest --> CLI: исключение без раскрытия токена
+          CLI -> FS: manifest: error по файлу\nпродолжить остальные файлы и чаты
+        end
+      end
+    end
+  end
+
+  CLI -> FS: task_<id>.md + task_<id>_<dialog>.md\nВложения: file_id + имя + локальный относительный путь\nлибо понятная ошибка скачивания
+  CLI -> FS: files/<dialog_id>/manifest.json\nитоговый статус каждого вложения
+end
+
+CLI --> User: Пути к JSON, Markdown, файлам и manifest\n+ счётчики success / skipped / error
+
+note over CLI,API
+  Основной серверный путь для файлов чата по официальной документации:
+  im.dialog.messages.get → FILE_ID → im.v2.File.download → GET downloadUrl.
+  downloadUrl одноразовый: запрашивать заново перед каждым новым скачиванием.
+  urlDownload из files[] предназначен для авторизованного контекста Bitrix24
+  и не должен быть основным путём webhook-интеграции.
+end note
+
+note over CLI,FS
+  disk.attachedObject.get принимает ID записи-связи, а не FILE_ID чата;
+  для этой доработки он не входит в основной поток.
+  Скачивание не должно менять исходный raw JSON: локальные пути и ошибки
+  хранятся отдельно в manifest и отражаются в Markdown.
+end note
+
+@enduml

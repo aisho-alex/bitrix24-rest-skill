@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bitrix24 через REST-вебхук: контекст задачи (карточка/комментарии/чаты) + список чатов и непрочитанные.
+"""Bitrix24 через REST-вебхук: контекст задачи, чаты, вложения + список чатов и непрочитанные.
 
 Портативно: вебхук ищется в --env / $BITRIX_WEBHOOK_URL / ./.env / ~/.bitrix.env /
 ~/.config/bitrix/webhook.env
@@ -8,6 +8,7 @@
     python3 fetch_bitrix_task_context.py 123456
     python3 fetch_bitrix_task_context.py --url "https://<portal>/company/personal/user/<uid>/tasks/task/view/123456/"
     python3 fetch_bitrix_task_context.py 123456 --out-dir ./bitrix --limit 1000
+    python3 fetch_bitrix_task_context.py 123456 --download-files
     python3 fetch_bitrix_task_context.py --dialog chat222222 --dialog chat333333
 
 Чаты и непрочитанное:
@@ -22,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -229,6 +231,143 @@ def extract_message_file_ids(message: dict[str, Any]) -> list[str]:
     if isinstance(raw, (str, int)):
         return [str(raw)]
     return [str(v) for v in raw]
+
+
+def collect_chat_attachments(chat: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = {
+        str(item.get("id")): item
+        for item in chat.get("files") or []
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    attachments: dict[str, dict[str, Any]] = {}
+    for message in chat["messages"]:
+        message_id = message.get("id")
+        for file_id in dict.fromkeys(extract_message_file_ids(message)):
+            file_meta = metadata.get(file_id) or {}
+            raw_size = file_meta.get("size")
+            try:
+                expected_size = int(raw_size) if raw_size is not None else None
+            except (TypeError, ValueError):
+                expected_size = None
+            attachment = attachments.setdefault(file_id, {
+                "file_id": file_id,
+                "name": str(file_meta.get("name") or f"file_{file_id}"),
+                "expected_size": expected_size,
+                "message_ids": [],
+            })
+            if message_id is not None and message_id not in attachment["message_ids"]:
+                attachment["message_ids"].append(message_id)
+    return list(attachments.values())
+
+
+def safe_attachment_filename(file_id: str, name: str) -> str:
+    clean = re.sub(r"[\\/]+", "_", str(name).replace("\x00", "")).strip()
+    clean = re.sub(r"[^\w.() -]+", "_", clean, flags=re.UNICODE)
+    clean = re.sub(r"\s+", "_", clean).strip(" ._") or f"file_{file_id}"
+    return f"{file_id}_{clean[:180]}"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_attachment(
+    rest: BitrixRest,
+    url: str,
+    target: Path,
+    expected_size: int | None,
+) -> tuple[int, str]:
+    portal = rest.webhook.split("/rest/")[0] + "/"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Referer": portal,
+    }
+    part = target.with_name(target.name + ".part")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with rest.session.get(url, headers=headers, stream=True, allow_redirects=True, timeout=300) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code} при скачивании файла")
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            disposition = (response.headers.get("Content-Disposition") or "").lower()
+            is_attachment = "attachment" in disposition
+            if ("text/html" in content_type or "json" in content_type) and not is_attachment:
+                raise RuntimeError(f"вместо файла получен ответ {content_type.split(';', 1)[0]}")
+            digest = hashlib.sha256()
+            size = 0
+            with part.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+        if expected_size is not None and size != expected_size:
+            raise RuntimeError(f"размер файла {size} не совпадает с метаданными {expected_size}")
+        part.replace(target)
+        return size, digest.hexdigest()
+    except requests.RequestException as exc:
+        part.unlink(missing_ok=True)
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        detail = f"HTTP {status}" if status else type(exc).__name__
+        raise RuntimeError(f"ошибка скачивания: {detail}") from None
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+
+
+def download_chat_files(
+    rest: BitrixRest,
+    chat: dict[str, Any],
+    out_dir: Path,
+) -> tuple[dict[str, dict[str, Any]], Path]:
+    dialog_id = chat["dialog_id"]
+    files_dir = out_dir / "files" / dialog_id
+    results: dict[str, dict[str, Any]] = {}
+    manifest_files: list[dict[str, Any]] = []
+    for attachment in collect_chat_attachments(chat):
+        file_id = attachment["file_id"]
+        target = files_dir / safe_attachment_filename(file_id, attachment["name"])
+        result: dict[str, Any] = {
+            "file_id": file_id,
+            "name": attachment["name"],
+            "message_ids": attachment["message_ids"],
+            "path": target.relative_to(out_dir).as_posix(),
+        }
+        try:
+            expected_size = attachment["expected_size"]
+            if target.is_file() and expected_size is not None and target.stat().st_size == expected_size:
+                result.update(status="skipped", size=expected_size, sha256=sha256_file(target))
+            else:
+                response = rest.result("im.v2.File.download", {
+                    "dialogId": dialog_id,
+                    "fileId": int(file_id) if file_id.isdigit() else file_id,
+                })
+                url = (response or {}).get("downloadUrl") if isinstance(response, dict) else None
+                if not url:
+                    raise RuntimeError("im.v2.File.download не вернул downloadUrl")
+                size, digest = download_attachment(rest, str(url), target, expected_size)
+                result.update(status="success", size=size, sha256=digest)
+        except Exception as exc:  # noqa: BLE001 - ошибка одного файла не отменяет выгрузку чата
+            result.update(status="error", error=str(exc))
+        results[file_id] = result
+        manifest_files.append(result)
+
+    files_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = files_dir / "manifest.json"
+    manifest = {
+        "dialog_id": dialog_id,
+        "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        "files": manifest_files,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return results, manifest_path
 
 
 # ----------------------------------------------------------------------------- чаты: список / непрочитанные
@@ -462,7 +601,12 @@ def sync_chat_users(rest: BitrixRest, chat: dict[str, Any]) -> None:
     chat["users"] = {**load_users(rest, missing), **known}
 
 
-def render_chat_md(task_id: str, chat: dict[str, Any], title: str) -> str:
+def render_chat_md(
+    task_id: str,
+    chat: dict[str, Any],
+    title: str,
+    attachments: dict[str, dict[str, Any]] | None = None,
+) -> str:
     users, messages = chat["users"], chat["messages"]
     real = [m for m in messages if not (CHAT_SERVICE_CODES & {str(c) for c in ((m.get("params") or {}).get("CODE") or [])})]
     lines = [
@@ -484,8 +628,24 @@ def render_chat_md(task_id: str, chat: dict[str, Any], title: str) -> str:
         lines.append("")
         lines.append(clean_bb(message.get("text") or message.get("message"), users) or "(без текста)")
         file_ids = extract_message_file_ids(message)
-        if file_ids:
+        if file_ids and attachments is None:
             lines += ["", f"Вложения (file id): {', '.join(file_ids)}"]
+        elif file_ids:
+            lines += ["", "Вложения:"]
+            for file_id in dict.fromkeys(file_ids):
+                attachment = (attachments or {}).get(file_id)
+                if not attachment:
+                    lines.append(f"- file id {file_id}")
+                    continue
+                name = str(attachment["name"]).replace("[", "\\[").replace("]", "\\]")
+                if attachment["status"] in ("success", "skipped"):
+                    lines.append(
+                        f"- [{name}]({attachment['path']}) "
+                        f"(file id {file_id}, {attachment['size']} байт; {attachment['status']})"
+                    )
+                else:
+                    error = str(attachment.get("error") or "неизвестная ошибка").replace("\n", " ")
+                    lines.append(f"- {name} (file id {file_id}) — ошибка выгрузки: {error}")
         lines.append("")
     return "\n".join(lines)
 
@@ -673,6 +833,14 @@ def run_task_mode(args: argparse.Namespace, rest: BitrixRest, portal: str, out_d
     json_path = out_dir / f"task_{task_id}.json"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
+    attachments_by_dialog: dict[str, dict[str, dict[str, Any]]] = {}
+    manifest_paths: dict[str, Path] = {}
+    if args.download_files:
+        for chat in chats:
+            attachments, manifest_path = download_chat_files(rest, chat, out_dir)
+            attachments_by_dialog[chat["dialog_id"]] = attachments
+            manifest_paths[chat["dialog_id"]] = manifest_path
+
     def who(uid: Any) -> str:
         uid = str(uid or "")
         return f"{users.get(uid, 'неизвестный')} (id {uid})" if uid else "—"
@@ -723,7 +891,8 @@ def run_task_mode(args: argparse.Namespace, rest: BitrixRest, portal: str, out_d
     for chat in chats:
         title = titles.get(chat["dialog_id"], f"Чат {chat['dialog_id']} (из описания задачи {task_id})")
         path = out_dir / f"task_{task_id}_{chat['dialog_id']}.md"
-        path.write_text(render_chat_md(task_id, chat, title), encoding="utf-8")
+        attachments = attachments_by_dialog.get(chat["dialog_id"]) if args.download_files else None
+        path.write_text(render_chat_md(task_id, chat, title, attachments), encoding="utf-8")
         chat_paths.append(path)
 
     print(f"Задача: {task.get('title') or '(карточка не загружена)'}")
@@ -732,6 +901,17 @@ def run_task_mode(args: argparse.Namespace, rest: BitrixRest, portal: str, out_d
     for chat, path in zip(chats, chat_paths):
         warn = f"  [ОШИБКА: {chat['error']}]" if chat.get("error") else ""
         print(f"Чат {chat['dialog_id']}: {chat['message_count']} сообщений -> {path}{warn}")
+        if args.download_files:
+            attachments = attachments_by_dialog[chat["dialog_id"]]
+            counts = {
+                status: sum(item["status"] == status for item in attachments.values())
+                for status in ("success", "skipped", "error")
+            }
+            print(
+                f"Файлы {chat['dialog_id']}: скачано {counts['success']}, "
+                f"пропущено {counts['skipped']}, ошибок {counts['error']} -> "
+                f"{manifest_paths[chat['dialog_id']]}"
+            )
     if legacy_error:
         print(f"Комментарии форума недоступны: {legacy_error}")
     if any(chat["message_count"] >= args.limit for chat in chats):
@@ -747,6 +927,7 @@ def main() -> None:
     parser.add_argument("--dialog", action="append", default=[], help="Дополнительный чат (chat222222); можно повторять")
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--limit", type=int, default=1000, help="максимум сообщений на чат")
+    parser.add_argument("--download-files", action="store_true", help="Скачать вложения чатов и записать manifest")
     parser.add_argument("--max-chats", type=int, default=8, help="сколько чатов из описания задачи тянуть")
     parser.add_argument("--env", help="Файл с BITRIX_WEBHOOK_URL")
     parser.add_argument("--webhook-url", help="Вебхук целиком (перекрывает .env)")

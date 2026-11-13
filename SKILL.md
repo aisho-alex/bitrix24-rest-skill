@@ -1,6 +1,6 @@
 ---
 name: bitrix24-rest-api
-description: "Bitrix24 umbrella — read/write portal data over the REST webhook: tasks and their chats/comments, kanban stages, users, disk files, plus the chat-list/unread digest and the task export + actualization (delta) workflow. Portal quirks, pagination, bbCode decoding, raw-REST wrapper, and the ready export scripts."
+description: "Bitrix24 umbrella — read/write portal data over the REST webhook: tasks and their chats/comments, kanban stages, users, disk files, downloading chat attachments, plus the chat-list/unread digest and the task export + actualization (delta) workflow. Portal quirks, pagination, bbCode decoding, raw-REST wrapper, and the ready export scripts."
 tags: [bitrix24, rest, webhook, tasks, chat, crm, bitrix24-mcp]
 ---
 
@@ -14,7 +14,7 @@ Use when the task mentions Bitrix24 / Битрикс24, a `*.bitrix24.*` portal 
 
 A webhook is created in Bitrix24 by a portal admin:
 *Рабочее пространство → Разработчикам → Другое → Входящий вебхук* — scope needs
-`task`, `im`, `user` (and `disk` if you want attachments). It looks like
+`task`, `im`, `user`; `im` is sufficient for downloading chat attachments. It looks like
 
     BITRIX_WEBHOOK_URL=https://<portal>/rest/<userId>/<token>/
 
@@ -139,6 +139,7 @@ pull 50 msgs per chat → filter locally by date for "today"/"yesterday".
 # задача + её чаты
 python3 scripts/fetch_bitrix_task_context.py 123456
 ... 123456 --out-dir ./bitrix --limit 1000          # куда писать / сколько сообщений на чат
+... 123456 --download-files                          # скачать вложения чатов + manifest
 ... --dialog chat222222 --dialog chat333333          # только конкретные чаты
 ... --webhook-url "https://portal/rest/1/token/"     # другой портал/вебхук
 
@@ -161,6 +162,8 @@ python3 scripts/fetch_bitrix_task_context.py 123456
 <out-dir>/task_<id>.json             всё сырьё: карточка, users, комменты, сообщения, meta чатов
 <out-dir>/task_<id>.md               карточка задачи + описание (чистый текст и raw bbCode) + список чатов
 <out-dir>/task_<id>_chat<NNN>.md     читаемая переписка: [дата] Автор (id) → текст, вложения
+<out-dir>/files/<dialog>/<fileId>_<имя>  скачанные вложения (при --download-files)
+<out-dir>/files/<dialog>/manifest.json   статусы, пути, размеры, sha256 и ошибки вложений
 <out-dir>/chats_recent.{md,json}     последние чаты: счётчик, тип, участники, последнее сообщение, ссылка
 <out-dir>/chats_unread.{md,json}     то же, только непрочитанные + сводка im.counters.get
 <out-dir>/chats_find_<запрос>.json   результат поиска чатов по названию
@@ -179,6 +182,7 @@ python3 scripts/fetch_bitrix_task_context.py 123456
 | карточка чата | `im.dialog.get` (`DIALOG_ID`) | имя, тип, владелец, участники, `message_count`, `last_message_id`, `readed_list` |
 | кто до чего прочитал | `readed_list` в `im.dialog.get` | НЕ включает текущего пользователя вебхука — своё прочтение смотреть по `counter` |
 | участники | `im.dialog.users.list` | с должностями и статусом online |
+| файлы чата | `im.dialog.messages.get` → `im.v2.File.download` (`dialogId`, `fileId`) → GET `downloadUrl` | `FILE_ID` и метаданные уже есть в истории; `downloadUrl` одноразовый, не логировать |
 | поиск по названию | `im.search.chat.list` (`FIND=`) | находит чаты/встречи/каналы, но НЕ чаты задач (у них имя = имя задачи, в поиск не попадают) |
 
 Виды чатов: `tasksTask` — чат задачи (entity `TASKS_TASK <taskId>`), `sonetGroup` —
@@ -200,6 +204,9 @@ python3 scripts/fetch_bitrix_task_context.py 123456
   задачу») — если содержательных 0, скорее всего взят не тот диалог или у вебхука нет
   доступа.
 - Файлы непустые и не содержат `null` вместо текста.
+- Для `--download-files`: сверить manifest с числом уникальных `FILE_ID`; у каждого `success`/`skipped`
+  должны быть существующий файл, размер и sha256. Ошибки одного вложения не отменяют остальную выгрузку.
+  В Markdown должны быть относительные локальные ссылки, а не подписанные `downloadUrl`.
 - Для `--unread`: сумма по чатам должна согласовываться с `im.counters.get`; если в
   выдаче 0 непрочитанных, но `TYPE.ALL > 0` — увеличить `--chats` (счётчик может быть
   у чата, который не попал в первые N) либо смотреть `*_UNREAD`-списки в JSON.
@@ -312,8 +319,9 @@ curl -s -X POST "${WH%/}/sonet_group.get.json" -H 'Content-Type: application/jso
 ```
 
 Другие полезные методы: `tasks.task.list` (фильтр по `GROUP_ID`), `task.stages.get`
-(`entityId=<groupId>` — стадии канбана), `task.stages.movetask`, `disk.attachedObject.get`
-(вложения по file id из `params.FILE_ID`), `im.chat.user.list` (`CHAT_ID=` → id участников).
+(`entityId=<groupId>` — стадии канбана), `task.stages.movetask`, `im.v2.File.download`
+(`dialogId` + `fileId` из `params.FILE_ID` → одноразовый `downloadUrl`),
+`im.chat.user.list` (`CHAT_ID=` → id участников).
 
 ## Файлы
 
@@ -327,6 +335,7 @@ curl -s -X POST "${WH%/}/sonet_group.get.json" -H 'Content-Type: application/jso
   чатов, а также режимы `--chats` / `--unread` / `--find` / `--info`.
 - `scripts/task_delta.py` — помощник дельты (baseline в `.delta_state.json`).
 - `scripts/delta_since.py` — новые сообщения чата после указанного TS.
+- `references/skill-chat-file-export.puml` — PlantUML-схема скилла и потока выгрузки вложений.
 - `scripts/fetch_bitrix_task_context.rest-api-legacy.py` — прежняя, более простая
   версия того же скрипта (только задача + чаты, без режимов чатов). Оставлена для
   сравнения; новая версия superset-ит её.
@@ -341,10 +350,10 @@ curl -s -X POST "${WH%/}/sonet_group.get.json" -H 'Content-Type: application/jso
   `KeyError: BITRIX_WEBHOOK_URL` — always assert the var is set before the first call.
 - `im.chat.get {"CHAT_ID": N}` returns `null` under a webhook — expected, don't debug it;
   `im.dialog.messages.get` carries chat_id + users + files anyway.
-- Attachments come back as `params.FILE_ID` ids only. On some cloud portals
-  `disk.attachedObject.get` / `disk.file.get` answer `ERROR_NOT_FOUND` and
-  `im.disk.file.get` may be missing — then the export keeps only the file id; say so
-  instead of retrying methods in a loop.
+- Chat attachments are linked by `params.FILE_ID`; names/sizes live in the response's `files[]`.
+  For server-side download call `im.v2.File.download` with `dialogId` + `fileId`, then GET its
+  one-time signed `downloadUrl`. Do not log that URL. `files[].urlDownload` is for an authorized
+  Bitrix24 context; `disk.attachedObject.get` expects an attachment-record id, not a chat `FILE_ID`.
 - `tasks.task.get` with `select` containing `UF_*` is fine, but some portals drop the
   whole card if any field is unknown — when the card comes back empty, retry with an
   explicit short `select` before concluding "no access".

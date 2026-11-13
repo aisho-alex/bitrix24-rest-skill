@@ -1,0 +1,21 @@
+# секреты
+.env
+*.env
+!.env.example
+bitrix.env
+
+# выгрузки и служебное состояние
+bitrix_export/
+bitrix/
+task_*.json
+task_*.md
+chats_*.json
+chats_*.md
+*_info.json
+.delta_state.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/

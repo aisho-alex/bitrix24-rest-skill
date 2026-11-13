@@ -110,8 +110,8 @@ worked example.
 ## 6. «Что нового в сообщениях» (дайджест непрочитанного)
 
 `im.recent.get` items carry `id` — and it may already be **prefixed**: on current cloud
-portals it is a string like `"chat277177"`, with the numeric `chat_id` next to it.
-If you blindly add the type (`f"chat{id}"`) you get `chatchat277177`
+portals it is a string like `"chat222222"`, with the numeric `chat_id` next to it.
+If you blindly add the type (`f"chat{id}"`) you get `chatchat222222`
 → `403 Forbidden` (chat) or `400 DIALOG_ID_EMPTY`. Rule: if `id` starts with
 `chat`/`user` — use it as is; otherwise prefix by `type`. Then `counter > 0` = unread, and
 `im.counters.get` gives the portal totals (`TYPE.ALL`, `CHAT_MUTED`, `*_UNREAD`).
